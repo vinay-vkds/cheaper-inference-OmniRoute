@@ -35,6 +35,15 @@ export const GEMINI_UNSUPPORTED_SCHEMA_KEYS = new Set([
   // decolua/9router#4283: ajv-errors `errorMessage` keyword emitted by some tool
   // generators — "Unknown name \"errorMessage\" ... Cannot find field".
   "errorMessage",
+  // Same class: the plural ajv-errors spelling, editor hints (`doNotSuggest`,
+  // `suggestSortText`) and OpenAPI-only annotations that a Pydantic/OpenAPI
+  // generator emits next to `oneOf` (`discriminator`, `xml`, `externalDocs`).
+  "errorMessages",
+  "doNotSuggest",
+  "suggestSortText",
+  "discriminator",
+  "xml",
+  "externalDocs",
   // decolua/9router#4169: Anthropic prompt-caching annotation leaking into tool
   // schemas — "Unknown name \"cache_control\" ... Cannot find field".
   "cache_control",
@@ -230,13 +239,14 @@ function normalizeGeminiMediaResolution(...values: unknown[]): JsonRecord | unde
 export function convertOpenAIContentToParts(content: unknown): JsonRecord[] {
   const parts: JsonRecord[] = [];
 
+  // Gemini rejects a part with an empty or missing `text`.
   if (typeof content === "string") {
-    parts.push({ text: content });
+    if (content) parts.push({ text: content });
   } else if (Array.isArray(content)) {
     for (const item of content) {
       const rec = toRecord(item);
       if (rec.type === "text") {
-        parts.push({ text: rec.text });
+        if (typeof rec.text === "string" && rec.text) parts.push({ text: rec.text });
       } else if (rec.type === "video_url" || rec.type === "input_video") {
         const video = videoPartToGemini(rec);
         if (video) parts.push(video);
@@ -559,7 +569,9 @@ function normalizeMalformedSchemaObjects(obj: unknown, parentKey?: string): void
     expandShorthandProperties(record);
   }
 
-  promoteBooleanRequired(record);
+  // Inside a name map (`properties`, `$defs`, …) every key is a property name: a parameter named
+  // `required` is not the schema keyword, and promoteBooleanRequired would delete it.
+  if (parentKey === undefined || !SCHEMA_MAP_KEYS.has(parentKey)) promoteBooleanRequired(record);
 
   for (const [key, value] of Object.entries(record)) {
     if (value && typeof value === "object") {
@@ -762,8 +774,10 @@ function convertEnumValuesToStrings(obj: unknown): void {
 
   const record = obj as JsonRecord;
   if (record.enum && Array.isArray(record.enum)) {
-    // Gemini only supports enum for string types, not integer
-    if (record.type === "integer" || record.type === "number") {
+    // Gemini only supports enum for string types, not integer. A type array such as
+    // ["integer", "null"] is flattened later, so look through it here.
+    const typeNames = Array.isArray(record.type) ? record.type : [record.type];
+    if (typeNames.includes("integer") || typeNames.includes("number")) {
       // Keep the enum's range as the tightest constraint Gemini accepts on numbers.
       const numbers = record.enum.filter((v): v is number => typeof v === "number");
       if (numbers.length > 0 && record.minimum === undefined && record.maximum === undefined) {
@@ -775,7 +789,11 @@ function convertEnumValuesToStrings(obj: unknown): void {
       // Gemini rejects an empty string inside `enum` ("enum[N]: cannot be empty"). Some MCP servers
       // declare optional choices as ["a", "b", ""]; drop the empty value, and the whole enum when
       // that was its only value, instead of failing every request that carries the tool.
-      const values = record.enum.map((v: unknown) => String(v)).filter((v) => v !== "");
+      // A JSON null in the enum marks a nullable value, not the string "null".
+      const values = record.enum
+        .filter((v: unknown) => v !== null)
+        .map((v: unknown) => String(v))
+        .filter((v) => v !== "");
       if (values.length > 0) {
         record.enum = values;
       } else {
